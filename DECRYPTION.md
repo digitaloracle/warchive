@@ -122,7 +122,7 @@ by testing each candidate against both databases simultaneously.
 ### 3c. Key values (this machine)
 
 The recovered keys are machine-specific and are **not committed**. They live in
-`D:\wa_cli\.env` (gitignored) and are loaded automatically at runtime:
+`.env` in the repo root (gitignored) and are loaded automatically at runtime:
 
 ```
 WA_GS_KEY=<redacted — see local .env>   # decrypts genericStorage.db (messages)
@@ -265,7 +265,7 @@ Join is by **display name** (the only common field), collected in a single pass.
 
 ### Known contact resolutions
 
-Cached in `D:\wa_cli\.wa_contact_cache.json` (last 20 queried):
+Cached in `.wa_contact_cache.json` in the repo root (last 20 queried):
 
 | Phone | LID | Display name |
 |---|---|---|

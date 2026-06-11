@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to `wa_cli`. Dates are absolute.
+All notable changes to `warchive`. Dates are absolute.
 
 ## 2026-06-11 — Review, cleanup, performance & features
 
@@ -92,7 +92,7 @@ was sound; this round hardened everything around it.
 
 ### Notes
 
-- `wa_search.py` runs from **two locations**: the dev copy in `D:\wa_cli` and the
+- `wa_search.py` runs from **two locations**: the dev copy in the repo root and the
   deployed copy the `/wa` skill executes (`~/.claude/skills/wa-query/`). Run
   `deploy.ps1` after any edit — the skill uses its own copy.
 - Windows only (relies on `ReadProcessMemory` / `VirtualQueryEx`).

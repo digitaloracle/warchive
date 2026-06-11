@@ -1,6 +1,6 @@
-# wa_cli — read your own WhatsApp Desktop history from the command line
+# warchive — read your own WhatsApp Desktop history from the command line
 
-`wa_cli` searches and reads your **WhatsApp Desktop for Windows** chat history
+`warchive` searches and reads your **WhatsApp Desktop for Windows** chat history
 directly from the app's encrypted local database — no QR code, no linked-device
 pairing, no proxy, no browser automation. It recovers the database key from the
 running app's memory, decrypts the SQLite database read-only, and gives you fast
@@ -154,7 +154,7 @@ that salt equals the WAL header salt (header bytes `16:24`).
 Replay therefore **must stop at the first frame whose salt doesn't match** — just
 as SQLite does. Skipping this check makes an old commit frame in the stale tail
 clobber live pages and truncate the database to a weeks-old snapshot, so recent
-messages silently vanish. `wa_cli` validates the salt and only replays the current
+messages silently vanish. `warchive` validates the salt and only replays the current
 generation.
 
 ### 4. Reading and caching
@@ -189,8 +189,8 @@ the install:**
   "mcpServers": {
     "whatsapp": {
       "command": "C:\\path\\to\\uv.exe",
-      "args": ["run", "--script", "C:\\path\\to\\wa_cli\\wa_mcp.py"],
-      "cwd": "C:\\path\\to\\wa_cli"
+      "args": ["run", "--script", "C:\\path\\to\\warchive\\wa_mcp.py"],
+      "cwd": "C:\\path\\to\\warchive"
     }
   }
 }
