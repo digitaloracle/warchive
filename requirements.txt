@@ -1,0 +1,15 @@
+# wa_search.py (CLI) dependencies — install with pip.
+# The MCP server (wa_mcp.py) does NOT use this file: its deps are declared inline
+# (PEP 723) and managed by uv — see `uv run --script wa_mcp.py`.
+#
+# Required:
+cryptography        # AES-256-OFB page decryption
+
+# Recommended (graceful fallback if absent):
+python-bidi         # correct RTL (Hebrew/Arabic) display in terminal output
+
+# Sender-direction (from_me) support — needs ONE of these to decompress
+# the WhatsApp IndexedDB LevelDB blocks. python-snappy is preferred; the
+# code falls back to cramjam automatically (see wa_search.py, SECTION 6.6).
+python-snappy
+# cramjam           # alternative to python-snappy if it won't build on your machine

@@ -1,0 +1,30 @@
+# ─── Secrets — recovered AES keys, NEVER commit ───────────────────────────────
+.env
+
+# ─── Personal data caches (machine-specific, regenerated on demand) ───────────
+_fromme_cache.json
+.wa_contact_cache.json
+wa_mirror.db
+wa_mirror.db-*
+
+# ─── Research artifacts & abandoned approaches (contain keys / real data) ─────
+archive/
+wa_profile/
+
+# ─── Third-party reference scripts (copyright their authors — keep only the
+#     attribution in reference/README.md, not the scripts themselves) ──────────
+reference/*.ps1
+
+# ─── Internal design / process docs (not part of the published project) ───────
+docs/superpowers/
+
+# ─── Python / tooling ─────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# ─── Editor / OS / backups ────────────────────────────────────────────────────
+*.bak
+.DS_Store
+Thumbs.db
