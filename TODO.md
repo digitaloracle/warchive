@@ -21,8 +21,17 @@ Effort: S (small) · M (medium) · L (large).
       "yesterday" resolved to `--since`/`--until` in CLI + MCP.
 
 ### Coverage
-- [ ] **Reply / quote context** (M) — show the message a reply quotes (needs
-      extracting the quoted ref from the LevelDB V8 objects — feasibility first).
+- [~] **Reply / quote context** (M–L) — *investigated, deferred.* The reply
+      fields exist in the LevelDB value (`quotedStanzaID` ~9% of messages,
+      `quotedParticipant`, `quotedRemoteJid`, `quotedMsg` ~1.7%, `parentMsgKey`),
+      but — unlike the group `author` object, whose values sit inline right after
+      the key (so a targeted parse worked) — the quoted *values* are not
+      positionally adjacent to their field names in the V8 object, so reliably
+      pulling the quoted stanza-id needs a proper V8 structured-clone parser (or
+      decoding the `parentMsgKey` value, same problem). Next step: write a minimal
+      V8 object walker to read `quotedStanzaID`/`parentMsgKey`, then look the
+      quoted id up in the mirror to show its text. Trivial reliable interim option:
+      an `is_reply` boolean flag (presence of the quoted fields).
 - [x] **Group-member attribution** (M) — who in a group sent each message,
       extracted from the LevelDB `author` JID-object and resolved to a name
       (~100% of group messages on the test install). Stored as sender/sender_name;
