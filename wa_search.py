@@ -1192,17 +1192,30 @@ def _ensure_vec_index(verbose=False):
     watermark = (wm[0] if wm else "") + "|" + _MIRROR_SCHEMA_VERSION
     fp_path = _VEC_PATH + ".fp"
     have_fp = open(fp_path, encoding="utf-8").read() if os.path.exists(fp_path) else None
-    if have_fp == watermark and wa_embed.index_count(_VEC_PATH) > 0:
+    have_count = wa_embed.index_count(_VEC_PATH)
+    if have_fp == watermark and have_count > 0:
         con.close()
-        return True
-    if verbose:
-        print("[vec] building semantic index (one-time per mirror change)...",
-              file=sys.stderr)
+        return True   # fully up to date
+
     rows = con.execute(
         "SELECT rowid, text FROM message WHERE text IS NOT NULL AND text <> ''"
     ).fetchall()
     con.close()
-    wa_embed.build_index(rows, _VEC_PATH, verbose=verbose)
+
+    # Messages are append-mostly, so a source change usually means a handful of
+    # NEW rows. Embed only those (seconds); reserve the full ~minutes-long build
+    # for the first run or a schema change.
+    schema_changed = (have_fp is None) or (have_fp.rsplit("|", 1)[-1] != _MIRROR_SCHEMA_VERSION)
+    if have_count == 0 or schema_changed:
+        if verbose:
+            print("[vec] full semantic index build (one-time)...", file=sys.stderr)
+        wa_embed.build_index(rows, _VEC_PATH, verbose=verbose)
+    else:
+        if verbose:
+            print("[vec] incremental semantic index update...", file=sys.stderr)
+        added = wa_embed.add_index(rows, _VEC_PATH, verbose=verbose)
+        if verbose:
+            print(f"[vec] {added} new vector(s) added", file=sys.stderr)
     try:
         with open(fp_path, "w", encoding="utf-8") as f:
             f.write(watermark)

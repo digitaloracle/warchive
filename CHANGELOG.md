@@ -22,7 +22,11 @@ was sound; this round hardened everything around it.
   - **Semantic vector search** (new module **`wa_embed.py`**): local, offline
     multilingual embeddings (`paraphrase-multilingual-MiniLM-L12-v2` via fastembed,
     stored in `sqlite-vec`), catching paraphrase and **cross-lingual Hebrew↔English**
-    matches. Built once per mirror change into `wa_vec.db`.
+    matches, in `wa_vec.db`. The full ~54k embed happens once; after that the index
+    updates **incrementally** — only new messages are embedded on a rebuild
+    (`wa_embed.add_index` / `indexed_ids`), turning a multi-minute rebuild into
+    seconds. (CUDA/ROCm GPU isn't used — the host is AMD-on-Windows; DirectML is a
+    possible future opt-in for the one-time first build.)
   - **Reciprocal Rank Fusion** of the lexical and semantic rankings (`--mode hybrid`,
     default; also `lexical` / `semantic`). Degrades gracefully to lexical-only when
     the embedding extras aren't installed (the bare pip CLI), so it never hard-fails.

@@ -482,6 +482,101 @@ def index_count(index_path: str) -> int:
             return 0
 
 
+def indexed_ids(index_path: str) -> set:
+    """Return the set of rowids currently present in the index (empty if none)."""
+    if _use_vec():
+        if not os.path.exists(index_path):
+            return set()
+        sqlite_vec = _sqlite_vec()
+        db = sqlite3.connect(index_path)
+        try:
+            db.enable_load_extension(True)
+            sqlite_vec.load(db)
+            db.enable_load_extension(False)
+            return {int(r[0]) for r in db.execute("SELECT rowid FROM vec_items")}
+        except Exception:
+            return set()
+        finally:
+            db.close()
+    else:
+        _, ids_path, _ = _npy_paths(index_path)
+        if not os.path.exists(ids_path):
+            return set()
+        try:
+            return {int(x) for x in _np().load(ids_path).tolist()}
+        except Exception:
+            return set()
+
+
+def add_index(rows: Iterable[tuple[int, str]], index_path: str, *,
+              verbose: bool = False) -> int:
+    """Incrementally embed and append ONLY rows whose rowid is not already indexed.
+
+    `rows` may be the full corpus — already-indexed rowids and empty texts are
+    skipped, so only new messages are embedded. Falls back to a full build when
+    no index exists yet. Returns the number of NEW rows added."""
+    existing = indexed_ids(index_path)
+    items: list[tuple[int, str]] = []
+    seen: set = set()
+    for rowid, text in rows:
+        if text is None or not str(text).strip():
+            continue
+        rid = int(rowid)
+        if rid in existing or rid in seen:
+            continue
+        seen.add(rid)
+        items.append((rid, str(text)))
+
+    if not existing:                      # nothing indexed yet -> normal build
+        return build_index(items, index_path, verbose=verbose)
+    if not items:
+        _log(verbose, "incremental: no new rows to embed")
+        return 0
+
+    model = _get_model(verbose=verbose)
+    if model is None:
+        return 0
+    np = _np()
+    ids = np.asarray([rid for rid, _ in items], dtype=np.int64)
+    texts = [t for _, t in items]
+    _log(verbose, f"incremental: embedding {len(texts)} new texts")
+    vecs = _embed_texts(texts, is_query=False, verbose=verbose)
+    dim = int(vecs.shape[1])
+    if _use_vec():
+        _append_index_vec(ids, vecs, dim, index_path, verbose=verbose)
+    else:
+        _append_index_npy(ids, vecs, dim, index_path, verbose=verbose)
+    return int(len(ids))
+
+
+def _append_index_vec(ids, vecs, dim: int, index_path: str, *, verbose: bool = False) -> None:
+    sqlite_vec = _sqlite_vec()
+    db = sqlite3.connect(index_path)
+    try:
+        db.enable_load_extension(True)
+        sqlite_vec.load(db)
+        db.enable_load_extension(False)
+        row = db.execute("SELECT value FROM wa_meta WHERE key='dim'").fetchone()
+        if row and int(row[0]) != dim:
+            raise ValueError(f"embedding dim mismatch: index {row[0]} != model {dim}")
+        db.executemany(
+            "INSERT OR REPLACE INTO vec_items(rowid, embedding) VALUES (?, ?)",
+            ((int(rid), _serialize_f32(vec)) for rid, vec in zip(ids.tolist(), vecs)),
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
+def _append_index_npy(ids, vecs, dim: int, index_path: str, *, verbose: bool = False) -> None:
+    np = _np()
+    vec_path, ids_path, _ = _npy_paths(index_path)
+    old_v = np.load(vec_path)
+    old_i = np.load(ids_path)
+    np.save(vec_path, np.vstack([old_v, vecs.astype(old_v.dtype)]))
+    np.save(ids_path, np.concatenate([old_i, ids.astype(old_i.dtype)]))
+
+
 # ---------------------------------------------------------------------------
 # Import-time best-effort availability probe (cheap; no model download)
 # ---------------------------------------------------------------------------
