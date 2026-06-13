@@ -1,3 +1,8 @@
+<p align="center">
+  <img src="assets/banner.png" width="480"
+       alt="warchive — a searchable, read-only archive of your own WhatsApp Desktop history">
+</p>
+
 # warchive — read your own WhatsApp Desktop history from the command line
 
 `warchive` searches and reads your **WhatsApp Desktop for Windows** chat history
