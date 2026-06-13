@@ -67,6 +67,12 @@ _PASSAGE_PREFIX = ""
 
 _BATCH_SIZE = 256
 
+# ONNX Runtime execution providers to request when loading the model. None =
+# fastembed default (CPU). Set via use_providers()/enable_gpu()/enable_directml()
+# BEFORE the model is first loaded (it is cached). Loading always falls back to CPU if
+# a requested GPU provider is unavailable, so this never hard-fails.
+_PROVIDERS: "list[str] | None" = None
+
 # Public availability flag / dimension. These are best-effort at import time
 # (cheap: we only check that the dependencies import) and are refined the first
 # time the model is actually loaded.
@@ -137,7 +143,19 @@ def _get_model(verbose: bool = False):
         from fastembed import TextEmbedding  # noqa: PLC0415
 
         _log(verbose, f"loading model {MODEL_NAME} (first run may download ~0.22 GB)")
-        _model = TextEmbedding(model_name=MODEL_NAME)
+        try:
+            _model = TextEmbedding(
+                model_name=MODEL_NAME,
+                **({"providers": _PROVIDERS} if _PROVIDERS else {}),
+            )
+            if _PROVIDERS:
+                _log(verbose, f"requested execution providers: {_PROVIDERS}")
+        except Exception as prov_exc:
+            if not _PROVIDERS:
+                raise
+            _log(verbose, f"GPU providers {_PROVIDERS} failed ({prov_exc!r}); "
+                          f"falling back to CPU")
+            _model = TextEmbedding(model_name=MODEL_NAME)
         # Confirm dimension from a tiny probe so DIM reflects reality.
         try:
             vec = next(iter(_model.embed(["dimension probe"])))
@@ -152,6 +170,55 @@ def _get_model(verbose: bool = False):
         EMBED_AVAILABLE = False
         _log(verbose, f"model load failed: {exc!r}")
         return None
+
+
+def available_providers() -> list:
+    """ONNX Runtime execution providers compiled into the installed onnxruntime."""
+    try:
+        import onnxruntime as ort  # noqa: PLC0415
+        return list(ort.get_available_providers())
+    except Exception:
+        return []
+
+
+def use_providers(providers) -> None:
+    """Set the ORT execution providers used when the model loads (call before
+    first embed). Pass None/empty to reset to the default (CPU)."""
+    global _PROVIDERS
+    _PROVIDERS = list(providers) if providers else None
+
+
+def enable_directml(verbose: bool = False) -> bool:
+    """Request the Windows DirectML execution provider — runs on any DX12 GPU
+    (AMD, NVIDIA, or Intel). Returns True if available, else False (stays on CPU).
+    Requires onnxruntime-directml installed in place of the stock CPU onnxruntime;
+    the CPU onnxruntime won't expose it."""
+    avail = available_providers()
+    if "DmlExecutionProvider" in avail:
+        use_providers(["DmlExecutionProvider", "CPUExecutionProvider"])
+        _log(verbose, "GPU enabled via DmlExecutionProvider (DirectML)")
+        return True
+    _log(verbose, "DirectML not available in this onnxruntime build; using CPU "
+                  "(pip install onnxruntime-directml to enable GPU on Windows)")
+    return False
+
+
+def enable_gpu(verbose: bool = False):
+    """Vendor-agnostic GPU opt-in: pick the best available execution provider
+    (CUDA for NVIDIA, then DirectML for any DX12 GPU), else stay on CPU. Returns
+    the chosen provider name or None. Safe everywhere — needs a GPU-enabled
+    onnxruntime (onnxruntime-gpu for CUDA / onnxruntime-directml for DirectML);
+    otherwise it just uses CPU."""
+    avail = available_providers()
+    for prov in ("CUDAExecutionProvider", "DmlExecutionProvider"):
+        if prov in avail:
+            use_providers([prov, "CPUExecutionProvider"])
+            _log(verbose, f"GPU enabled via {prov}")
+            return prov
+    _log(verbose, "no GPU execution provider available; using CPU "
+                  "(install onnxruntime-gpu for NVIDIA, or onnxruntime-directml "
+                  "for DirectML/AMD on Windows)")
+    return None
 
 
 def _embed_texts(texts: list[str], *, is_query: bool, verbose: bool = False):

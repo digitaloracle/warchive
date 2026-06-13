@@ -220,6 +220,46 @@ Use absolute paths (Claude Desktop doesn't inherit your PATH). Restart Desktop,
 then ask it to *"search my WhatsApp for …"*. If a tool errors, ask it to run
 `wa_status` first — it reports whether WhatsApp is reachable without rebuilding.
 
+### GPU embeddings (optional)
+
+**By default, embeddings run on CPU — this works identically on NVIDIA, AMD, and
+no-GPU machines, and a fresh `pip install`/`uv run` never pulls any GPU package.**
+GPU is strictly opt-in and only accelerates the *one-time* full index build (with
+incremental updates, the ongoing cost is already trivial).
+
+To use a GPU you install a GPU-enabled `onnxruntime` **yourself** (it is never a
+project dependency, because the right build is vendor- and OS-specific and the
+wrong one would break other setups), then pass `--gpu` (auto-detect) or
+`--directml`:
+
+| Your GPU | Install (into the env that runs embeddings) | Then run with |
+|---|---|---|
+| Any GPU on Windows (AMD / NVIDIA / Intel) | `pip install onnxruntime-directml` | `--gpu` or `--directml` |
+| NVIDIA (CUDA) | `pip install onnxruntime-gpu` | `--gpu` |
+
+On Windows + AMD (e.g. a Radeon RX 7900 XTX), **DirectML** is the path — it runs
+the ONNX model on any DirectX 12 GPU and ships as a normal pip wheel (no ROCm
+toolchain or Linux-only wheels needed). Note `onnxruntime-directml` replaces the
+stock CPU `onnxruntime` in that environment (same `onnxruntime` import, with the
+DirectML provider added).
+
+```powershell
+python wa_search.py --refresh --gpu     # build/refresh the index on the GPU
+```
+
+For the MCP server (which uses `uv`), don't edit the committed deps — layer the
+GPU runtime in at launch so the default stays portable. In your Desktop config:
+
+```jsonc
+"args": ["run", "--with", "onnxruntime-directml",
+         "--script", "C:\\path\\to\\warchive\\wa_mcp.py", "--gpu"]
+// or set "env": { "WA_GPU": "1" }
+```
+
+If no GPU-enabled `onnxruntime` is present, `--gpu`/`--directml` log a one-line
+notice and **fall back to CPU — nothing breaks**. `wa_status` reports the active
+providers.
+
 ## Repository layout
 
 | Path | What |

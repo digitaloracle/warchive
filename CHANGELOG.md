@@ -25,8 +25,18 @@ was sound; this round hardened everything around it.
     matches, in `wa_vec.db`. The full ~54k embed happens once; after that the index
     updates **incrementally** — only new messages are embedded on a rebuild
     (`wa_embed.add_index` / `indexed_ids`), turning a multi-minute rebuild into
-    seconds. (CUDA/ROCm GPU isn't used — the host is AMD-on-Windows; DirectML is a
-    possible future opt-in for the one-time first build.)
+    seconds.
+  - **Optional GPU embedding (`--gpu` / `--directml`)**: opt-in acceleration via
+    the ONNX Runtime execution providers — `--gpu` auto-selects CUDA (NVIDIA) →
+    DirectML (any DX12 GPU); `--directml` forces DirectML, which is the AMD-on-
+    Windows path (`onnxruntime-directml`, a normal pip wheel — no ROCm/Linux
+    toolchain). MCP server: `--gpu`/`--directml` arg or `WA_GPU`/`WA_DIRECTML` env.
+    **CPU stays the default and no GPU package is ever a project dependency**, so
+    fresh NVIDIA/AMD/CPU installs are unaffected; the user installs the matching
+    `onnxruntime-gpu`/`onnxruntime-directml` and the flags fall back to CPU (with a
+    notice) if it's absent. `wa_status` reports the active providers.
+    `wa_embed.enable_gpu()` / `enable_directml()` / `use_providers()` /
+    `available_providers()`.
   - **Reciprocal Rank Fusion** of the lexical and semantic rankings (`--mode hybrid`,
     default; also `lexical` / `semantic`). Degrades gracefully to lexical-only when
     the embedding extras aren't installed (the bare pip CLI), so it never hard-fails.

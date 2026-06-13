@@ -27,6 +27,7 @@ wa_search.py. stdout is the MCP protocol channel, so this module never prints to
 
 import os
 import sqlite3
+import sys
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -177,10 +178,24 @@ def wa_status() -> dict[str, Any]:
             out["newest"] = wa_search._ts_to_str(mx) if mx else None
         except sqlite3.Error:
             pass
+    if wa_search.wa_embed:
+        emb = wa_search.wa_embed
+        out["embeddings_available"] = bool(getattr(emb, "EMBED_AVAILABLE", False))
+        out["embedding_providers"] = getattr(emb, "_PROVIDERS", None) or ["CPUExecutionProvider"]
     return out
 
 
 def main():
+    # Opt-in GPU embeddings: add "--gpu" (auto: CUDA/NVIDIA or DirectML/any DX12
+    # GPU) or "--directml" (force Windows DirectML) to the server's args in
+    # claude_desktop_config.json, or set WA_GPU=1 / WA_DIRECTML=1. CPU is the
+    # default; falls back to CPU if a GPU-enabled onnxruntime isn't installed.
+    emb = wa_search.wa_embed
+    if emb:
+        if "--directml" in sys.argv or os.environ.get("WA_DIRECTML"):
+            emb.enable_directml()
+        elif "--gpu" in sys.argv or os.environ.get("WA_GPU"):
+            emb.enable_gpu()
     mcp.run()   # stdio transport by default
 
 

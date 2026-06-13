@@ -1743,8 +1743,20 @@ def main():
                     help="Include N messages before/after each hit (same chat)")
     ap.add_argument("--recency",     action="store_true",
                     help="Blend recency into ranking (favor newer matches)")
+    ap.add_argument("--gpu",         action="store_true",
+                    help="Use a GPU for embeddings if available (auto: CUDA/NVIDIA "
+                         "or DirectML/any DX12 GPU); falls back to CPU. Opt-in.")
+    ap.add_argument("--directml",    action="store_true",
+                    help="Force the Windows DirectML GPU provider for embeddings "
+                         "(AMD/NVIDIA/Intel; needs onnxruntime-directml — else CPU)")
     ap.add_argument("--verbose",     action="store_true")
     args = ap.parse_args()
+
+    if wa_embed:
+        if args.directml:
+            wa_embed.enable_directml(verbose=args.verbose)
+        elif args.gpu:
+            wa_embed.enable_gpu(verbose=args.verbose)
 
     try:
         session_dir = args.session_dir or _find_session_dir()
