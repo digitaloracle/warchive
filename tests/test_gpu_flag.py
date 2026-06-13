@@ -13,6 +13,10 @@ import os
 import sys
 import tempfile
 
+# Make the repo-root modules importable when run from tests/.
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+
 import wa_embed
 
 fails = []

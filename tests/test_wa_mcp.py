@@ -20,6 +20,10 @@ def check(name, cond, detail=""):
 
 
 # 1) stdout discipline: importing wa_mcp + calling tools must emit nothing to stdout
+# Make the repo-root modules importable when run from tests/.
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+
 buf = io.StringIO()
 with redirect_stdout(buf):
     import wa_mcp
