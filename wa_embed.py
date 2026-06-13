@@ -520,6 +520,38 @@ def _search_npy(qvec, index_path: str, top_k: int) -> list[tuple[int, float]]:
     return [(int(ids[i]), float(sims[i])) for i in idx]
 
 
+_rank_cache: dict = {}   # tuple(candidates) -> embedded candidate matrix
+
+
+def rank_names(query: str, candidates, top_k: int = 4) -> list[tuple[int, float]]:
+    """Rank `candidates` (list of strings, e.g. chat/contact names) by cosine
+    similarity to `query`; returns [(candidate_index, cosine)] best-first.
+
+    Candidate embeddings are cached across calls (the candidate set rarely
+    changes) so only the query is embedded per call — cheap enough to run on
+    every search. Indices align to the input list. [] if embeddings unavailable."""
+    if not candidates or _get_model() is None:
+        return []
+    key = tuple(candidates)
+    try:
+        np = _np()
+        cv = _rank_cache.get(key)
+        if cv is None:
+            cv = _embed_texts([str(c) if c and str(c).strip() else " " for c in candidates],
+                              is_query=False)
+            _rank_cache.clear()          # only keep the current candidate set
+            _rank_cache[key] = cv
+        qv = _embed_texts([str(query)], is_query=True)[0]
+        sims = cv @ qv.astype(cv.dtype)
+        k = min(int(top_k), sims.shape[0])
+        if k <= 0:
+            return []
+        idx = np.argsort(-sims)[:k]
+        return [(int(i), float(sims[i])) for i in idx]
+    except Exception:
+        return []
+
+
 def index_count(index_path: str) -> int:
     """Return the number of vectors stored in the index (0 if none/missing)."""
     if _use_vec():

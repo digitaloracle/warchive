@@ -57,12 +57,33 @@ before publishing.
 
 Requires Python 3.10+ on Windows.
 
+**From source** (run the script in place):
+
 ```powershell
 pip install -r requirements.txt
+python wa_search.py --list-chats
+```
+
+**As a package** (gives you `warchive` and `warchive-mcp` commands), built/installed
+with [uv](https://docs.astral.sh/uv/):
+
+```powershell
+uv build                         # -> dist/warchive-*.whl
+uv tool install dist/warchive-*.whl              # base (CPU, lexical)
+# extras:  uv tool install "warchive[semantic,mcp]"   # + semantic search + MCP
+```
+
+When installed as a package the script lives in read-only site-packages, so point
+state (keys, mirror, caches) at a writable folder via **`WARCHIVE_HOME`**:
+
+```powershell
+$env:WARCHIVE_HOME = "$env:LOCALAPPDATA\warchive"
+warchive --list-chats
 ```
 
 Only `cryptography` is strictly required; `python-bidi` (RTL display) and
-`python-snappy` (sender-direction support) are recommended.
+`python-snappy` (sender-direction) are recommended; the `semantic` extra adds
+embeddings. (Running from source keeps state next to the script as before.)
 
 ## First run
 

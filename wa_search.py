@@ -16,7 +16,7 @@ Usage:
   wa_search.py --dump-key          # print recovered DB key and exit
 """
 
-import argparse, csv, ctypes, datetime, html, io, json, math, os, re, sqlite3, struct, sys
+import argparse, csv, ctypes, datetime, difflib, html, io, json, math, os, re, sqlite3, struct, sys
 
 try:
     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms
@@ -87,8 +87,17 @@ _cached_name_rows   = None   # lid → display name, full contacts.db load
 
 # ── Persistent state ────────────────────────────────────────────────────────
 _SCRIPT_DIR        = os.path.dirname(os.path.abspath(__file__))
-_ENV_FILE          = os.path.join(_SCRIPT_DIR, ".env")
-_CONTACT_CACHE     = os.path.join(_SCRIPT_DIR, ".wa_contact_cache.json")
+# State (keys, mirror, caches) lives in _DATA_DIR. Defaults to the script's
+# directory — so source checkouts, the /wa skill, and the MCP server keep their
+# existing files — but a pip-installed copy (where the script sits in read-only
+# site-packages) should set WARCHIVE_HOME to a writable folder.
+_DATA_DIR          = os.environ.get("WARCHIVE_HOME") or _SCRIPT_DIR
+try:
+    os.makedirs(_DATA_DIR, exist_ok=True)
+except OSError:
+    pass
+_ENV_FILE          = os.path.join(_DATA_DIR, ".env")
+_CONTACT_CACHE     = os.path.join(_DATA_DIR, ".wa_contact_cache.json")
 _CONTACT_CACHE_MAX = 20
 
 
@@ -767,7 +776,7 @@ _LDB_DIR = os.path.join(
     r"\LocalCache\EBWebView\Default\IndexedDB"
     r"\https_web.whatsapp.com_0.indexeddb.leveldb",
 )
-_FROMME_CACHE_FILE = os.path.join(_SCRIPT_DIR, "_fromme_cache.json")
+_FROMME_CACHE_FILE = os.path.join(_DATA_DIR, "_fromme_cache.json")
 _cached_fromme = None   # dict[str, bool] once loaded
 
 _WA_KEY_RE = re.compile(r'^(true|false)_', re.IGNORECASE)
@@ -1003,12 +1012,16 @@ def _get_fromme(msg_id):
 # genericStorage.db and its WAL). A warm query touches none of the encrypted source
 # and works even when WhatsApp is closed.
 
-_MIRROR_PATH           = os.path.join(_SCRIPT_DIR, "wa_mirror.db")
-_VEC_PATH              = os.path.join(_SCRIPT_DIR, "wa_vec.db")   # semantic index
+_MIRROR_PATH           = os.path.join(_DATA_DIR, "wa_mirror.db")
+_VEC_PATH              = os.path.join(_DATA_DIR, "wa_vec.db")   # semantic index
 # Bump when the build logic changes in a way that invalidates existing mirrors.
 # v2: WAL salt-generation fix — v1 mirrors were truncated to a stale snapshot.
 # v3: added FTS5 (normalized/stemmed) index for lexical retrieval.
 _MIRROR_SCHEMA_VERSION = "3"
+# Separate from the mirror schema: the embedding index only needs rebuilding when
+# the *embedding* logic changes, not when we add SQL columns. Keeping this
+# independent means a mirror schema bump no longer forces a full re-embed.
+_VEC_SCHEMA_VERSION = "1"
 
 
 def _source_watermark(session_dir):
@@ -1189,7 +1202,9 @@ def _ensure_vec_index(verbose=False):
         wm = con.execute("SELECT v FROM meta WHERE k='watermark'").fetchone()
     except sqlite3.Error:
         return False
-    watermark = (wm[0] if wm else "") + "|" + _MIRROR_SCHEMA_VERSION
+    # Fingerprint is watermark + the EMBEDDING schema (not the mirror schema), so
+    # adding SQL columns never forces a re-embed — only changes to how we embed do.
+    watermark = (wm[0] if wm else "") + "|" + _VEC_SCHEMA_VERSION
     fp_path = _VEC_PATH + ".fp"
     have_fp = open(fp_path, encoding="utf-8").read() if os.path.exists(fp_path) else None
     have_count = wa_embed.index_count(_VEC_PATH)
@@ -1204,8 +1219,8 @@ def _ensure_vec_index(verbose=False):
 
     # Messages are append-mostly, so a source change usually means a handful of
     # NEW rows. Embed only those (seconds); reserve the full ~minutes-long build
-    # for the first run or a schema change.
-    schema_changed = (have_fp is None) or (have_fp.rsplit("|", 1)[-1] != _MIRROR_SCHEMA_VERSION)
+    # for the first run or an embedding-schema change.
+    schema_changed = (have_fp is None) or (have_fp.rsplit("|", 1)[-1] != _VEC_SCHEMA_VERSION)
     if have_count == 0 or schema_changed:
         if verbose:
             print("[vec] full semantic index build (one-time)...", file=sys.stderr)
@@ -1371,6 +1386,49 @@ def _fetch_rows(con, rowids):
     return [by_id[rid] for rid in rowids if rid in by_id]
 
 
+def _name_chat_candidates(con, query_text, fwhere, fparams, limit, *, sem_threshold=0.55):
+    """Recent message rowids from chats whose DISPLAY NAME matches the query —
+    lexically (shared normalized tokens) and, when embeddings exist, semantically
+    (cosine over chat names, so 'haircut' surfaces a 'hair styling' chat, even
+    cross-lingually). Respects the active non-text filters. [] if nothing matches."""
+    chats = [(r[0], r[1] or "") for r in con.execute(
+        "SELECT chatId, MAX(display) FROM message GROUP BY chatId")]
+    if not chats:
+        return []
+    matched = set()
+    qtokens = set(_norm_tokens(query_text))
+    if qtokens:
+        for cid, disp in chats:
+            name_toks = set(_norm_tokens(disp))
+            if qtokens & name_toks:                       # exact token overlap
+                matched.add(cid)
+                continue
+            # typo tolerance: a query token close to a name token (one-letter typos).
+            for qt in qtokens:
+                if len(qt) >= 4 and difflib.get_close_matches(qt, name_toks, n=1, cutoff=0.8):
+                    matched.add(cid)
+                    break
+    if wa_embed and getattr(wa_embed, "EMBED_AVAILABLE", False):
+        try:
+            for i, score in wa_embed.rank_names(query_text, [d for _, d in chats], top_k=4):
+                if score >= sem_threshold:
+                    matched.add(chats[i][0])
+        except Exception:
+            pass
+    if not matched:
+        return []
+    qm = ",".join("?" * len(matched))
+    where = [f"chatId IN ({qm})"]
+    params = list(matched)
+    if fwhere:
+        where.append(fwhere)
+        params += fparams
+    params.append(limit)
+    return [r[0] for r in con.execute(
+        "SELECT rowid FROM message WHERE " + " AND ".join(where)
+        + " ORDER BY ts_epoch DESC LIMIT ?", params)]
+
+
 def _mirror_search(lid_filter, phone_filter, chat_lower, query_terms,
                    since_epoch, until_epoch, *, query_text="", mode="hybrid",
                    from_me=None, top_k=None, recency=False):
@@ -1410,13 +1468,19 @@ def _mirror_search(lid_filter, phone_filter, chat_lower, query_terms,
     sem = _semantic_ids(query_text, _allowed_ids(con, fwhere, fparams), pool) \
         if mode in ("hybrid", "semantic") else []
 
+    # Chat/contact-name matches: when the query names a chat (e.g. a person or a
+    # business), surface that chat's recent messages even if no body matches —
+    # lexically, and cross-lingually when embeddings exist (haircut→"hair styling").
+    name_ids = _name_chat_candidates(con, query_text, fwhere, fparams, pool)
+
     if mode == "lexical":
-        ranked = lex
+        primary = [lex]
     elif mode == "semantic":
-        ranked = sem or lex                       # degrade to lexical if no embeddings
+        primary = [sem or lex]                    # degrade to lexical if no embeddings
     else:
-        lists = [x for x in (lex, sem) if x]
-        ranked = _rrf(lists) if len(lists) > 1 else (lists[0] if lists else [])
+        primary = [x for x in (lex, sem) if x]
+    lists = [x for x in (primary + [name_ids]) if x]
+    ranked = _rrf(lists) if len(lists) > 1 else (lists[0] if lists else [])
 
     if not ranked:                                # safety net: old substring matcher
         ranked = _like_fallback(con, query_terms, fwhere, fparams, pool)
@@ -1479,10 +1543,104 @@ def _emit_html(results):
 # SECTION 7 — public query API (shared by the CLI and the MCP server)
 # ══════════════════════════════════════════════════════════════════════════════
 
+_WEEKDAYS = {"monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3, "friday": 4,
+             "saturday": 5, "sunday": 6, "mon": 0, "tue": 1, "tues": 1, "wed": 2,
+             "thu": 3, "thur": 4, "thurs": 4, "fri": 4, "sat": 5, "sun": 6}
+_MONTHS = {}
+for _i, _m in enumerate(["january", "february", "march", "april", "may", "june",
+                         "july", "august", "september", "october", "november",
+                         "december"], 1):
+    _MONTHS[_m] = _i
+    _MONTHS[_m[:3]] = _i
+
+
 def _parse_date(s, end_of_day=False):
-    """Parse 'YYYY-MM-DD' to an epoch int. Raises ValueError on bad input."""
-    base = int(datetime.datetime.strptime(s, "%Y-%m-%d").timestamp())
-    return base + 86399 if end_of_day else base   # inclusive end of day
+    """Parse a date to epoch seconds. Accepts 'YYYY-MM-DD' or natural phrases:
+    today, yesterday, tomorrow, 'N days/weeks/months/years ago', this/last
+    week|month|year, 'last <weekday>' or a bare weekday, or a month name.
+    `end_of_day` returns 23:59:59 of that day (inclusive range end).
+    Raises ValueError if unrecognised."""
+    s = (s or "").strip().lower()
+    today = datetime.datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+
+    def out(d):
+        if end_of_day:
+            d = d + datetime.timedelta(days=1) - datetime.timedelta(seconds=1)
+        return int(d.timestamp())
+
+    try:
+        return out(datetime.datetime.strptime(s, "%Y-%m-%d"))
+    except ValueError:
+        pass
+
+    if s == "today":
+        return out(today)
+    if s == "yesterday":
+        return out(today - datetime.timedelta(days=1))
+    if s == "tomorrow":
+        return out(today + datetime.timedelta(days=1))
+
+    m = re.fullmatch(r"(\d+)\s+(day|week|month|year)s?\s+ago", s)
+    if m:
+        n = int(m.group(1))
+        days = n * {"day": 1, "week": 7, "month": 30, "year": 365}[m.group(2)]
+        return out(today - datetime.timedelta(days=days))
+
+    if s == "this week":
+        return out(today - datetime.timedelta(days=today.weekday()))
+    if s == "last week":
+        return out(today - datetime.timedelta(days=today.weekday() + 7))
+    if s == "this month":
+        return out(today.replace(day=1))
+    if s == "last month":
+        return out((today.replace(day=1) - datetime.timedelta(days=1)).replace(day=1))
+    if s == "this year":
+        return out(today.replace(month=1, day=1))
+
+    m = re.fullmatch(r"(?:last\s+|this\s+)?(" + "|".join(_WEEKDAYS) + r")", s)
+    if m:
+        delta = (today.weekday() - _WEEKDAYS[m.group(1)]) % 7
+        return out(today - datetime.timedelta(days=delta or 7))
+
+    if s in _MONTHS:
+        cand = today.replace(month=_MONTHS[s], day=1)
+        if cand > today:
+            cand = cand.replace(year=cand.year - 1)
+        return out(cand)
+
+    raise ValueError(f"unrecognised date: {s!r}")
+
+
+_FIELD_RE = re.compile(r'(?:^|\s)(from|in|chat|before|after|since|until):'
+                       r'("[^"]+"|\S+)', re.IGNORECASE)
+
+
+def _parse_query_fields(query):
+    """Pull field tokens out of a query string and map them to filters.
+
+    Supports `from:me|them`, `in:NAME` / `chat:NAME`, `before:`/`until:` and
+    `after:`/`since:` (dates may be relative). Returns (clean_query, fields)
+    where fields ⊆ {chat, since, until, from_me}. Quoted values keep spaces."""
+    if not query:
+        return query, {}
+    fields = {}
+
+    def repl(m):
+        key, val = m.group(1).lower(), m.group(2).strip('"')
+        if key == "from":
+            v = val.lower()
+            fields["from_me"] = (True if v in ("me", "self", "i", "mine")
+                                 else False if v in ("them", "other", "theirs") else None)
+        elif key in ("in", "chat"):
+            fields["chat"] = val
+        elif key in ("before", "until"):
+            fields["until"] = val
+        elif key in ("after", "since"):
+            fields["since"] = val
+        return " "
+
+    clean = re.sub(r"\s+", " ", _FIELD_RE.sub(repl, query)).strip()
+    return clean, fields
 
 
 def _build_display_map():
@@ -1527,6 +1685,20 @@ def query_messages(query=None, chat=None, phone=None, since=None, until=None,
     `mode` ∈ {hybrid, lexical, semantic} (mirror path). `from_me` True/False/None
     filters by direction. `context` adds N neighbouring messages around each hit.
     `recency` blends recency into ranking. Shared by the CLI and the MCP server."""
+    # Field tokens in the query (from:me, in:Alice, before:yesterday, …) fill in
+    # any filter not already set explicitly by the caller.
+    if query:
+        query, _fields = _parse_query_fields(query)
+        query = query or None
+        if chat is None:
+            chat = _fields.get("chat")
+        if since is None:
+            since = _fields.get("since")
+        if until is None:
+            until = _fields.get("until")
+        if from_me is None and "from_me" in _fields:
+            from_me = _fields["from_me"]
+
     session_dir = session_dir or _find_session_dir()
     if use_mirror:
         use_mirror = _ensure_mirror_soft(session_dir, refresh, verbose)
@@ -1683,6 +1855,37 @@ def get_chats(*, session_dir=None, use_mirror=True, refresh=False, verbose=False
             for (j, d, c, lt) in rows]
 
 
+def find_similar(ref, top_k=10, *, session_dir=None, use_mirror=True, verbose=False):
+    """Return messages semantically similar to a reference — given by its message
+    id, its rowid, or a raw text string — best-first. Uses the existing vector
+    index; returns [] if the semantic extras aren't available."""
+    if not (wa_embed and getattr(wa_embed, "EMBED_AVAILABLE", False)):
+        return []
+    session_dir = session_dir or _find_session_dir()
+    if use_mirror:
+        _ensure_mirror_soft(session_dir, False, verbose)
+    if not os.path.exists(_MIRROR_PATH):
+        return []
+    con = sqlite3.connect(_MIRROR_PATH)
+    con.row_factory = sqlite3.Row
+    text, self_rowid = str(ref), None
+    row = con.execute("SELECT rowid, text FROM message WHERE id=? LIMIT 1",
+                      (str(ref),)).fetchone()
+    if not row and str(ref).isdigit():
+        row = con.execute("SELECT rowid, text FROM message WHERE rowid=? LIMIT 1",
+                          (int(ref),)).fetchone()
+    if row:
+        text, self_rowid = row["text"], row["rowid"]
+    if not (text and text.strip()) or not _ensure_vec_index(verbose=verbose):
+        con.close()
+        return []
+    hits = wa_embed.search(text, _VEC_PATH, top_k=top_k + 1)
+    ids = [rid for rid, _score in hits if rid != self_rowid][:top_k]
+    rows = _fetch_rows(con, ids)
+    con.close()
+    return [_row_to_result(r, text) for r in rows]
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # SECTION 8 — CLI entry point
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1739,6 +1942,9 @@ def main():
                     help="Only messages you sent")
     ap.add_argument("--theirs",      action="store_true",
                     help="Only messages you received")
+    ap.add_argument("--like",        metavar="MSG_ID",
+                    help="Find messages semantically similar to this message id "
+                         "(or rowid); needs the semantic extras")
     ap.add_argument("--context",     metavar="N", type=int, default=0,
                     help="Include N messages before/after each hit (same chat)")
     ap.add_argument("--recency",     action="store_true",
@@ -1813,15 +2019,24 @@ def main():
         return
 
     from_me = True if args.mine else False if args.theirs else None
-    try:
-        results = query_messages(
-            query=args.query, chat=args.chat, phone=args.phone,
-            since=args.since, until=args.until, top_k=args.top_k,
-            mode=args.mode, from_me=from_me, context=args.context,
-            recency=args.recency, session_dir=args.session_dir,
-            use_mirror=use_mirror, refresh=args.refresh, verbose=args.verbose)
-    except ValueError:
-        sys.exit("--since / --until must be YYYY-MM-DD")
+    if args.like:
+        results = find_similar(args.like, top_k=args.top_k or 10,
+                               session_dir=args.session_dir, use_mirror=use_mirror,
+                               verbose=args.verbose)
+        if not results and not (wa_embed and getattr(wa_embed, "EMBED_AVAILABLE", False)):
+            sys.exit("--like needs the semantic extras (see README: GPU/embedding "
+                     "install) and a built index")
+    else:
+        try:
+            results = query_messages(
+                query=args.query, chat=args.chat, phone=args.phone,
+                since=args.since, until=args.until, top_k=args.top_k,
+                mode=args.mode, from_me=from_me, context=args.context,
+                recency=args.recency, session_dir=args.session_dir,
+                use_mirror=use_mirror, refresh=args.refresh, verbose=args.verbose)
+        except ValueError as e:
+            sys.exit(f"--since / --until: {e} (use YYYY-MM-DD or e.g. 'yesterday', "
+                     f"'last week', '3 days ago')")
 
     if args.compact:
         for r in results:

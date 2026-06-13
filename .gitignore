@@ -23,6 +23,9 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+dist/
+build/
+*.egg-info/
 
 # ─── Editor / OS / backups ────────────────────────────────────────────────────
 *.bak

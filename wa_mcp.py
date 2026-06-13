@@ -113,6 +113,25 @@ def search_messages(query: str = "", chat: str = "", phone: str = "",
 
 
 @mcp.tool()
+def find_similar(message_id: str, top_k: int = 10) -> dict[str, Any]:
+    """Find messages semantically similar in meaning to a given message — useful
+    for "more like this" / surfacing related discussion across chats.
+
+    Args:
+        message_id: the `id` (or rowid) of the reference message.
+        top_k: max results (default 10).
+
+    Returns: {returned, messages:[{timestamp, direction, display, chatId, text,
+    snippet}]}. Needs the semantic extras; returns an empty list if unavailable.
+    """
+    try:
+        results = wa_search.find_similar(message_id, top_k=top_k)
+    except Exception as e:  # noqa: BLE001
+        return _err(e)
+    return {"returned": len(results), "messages": [_shape(r) for r in results]}
+
+
+@mcp.tool()
 def list_chats() -> dict[str, Any]:
     """List all WhatsApp chats with message counts and last-message time, busiest
     first. Use this to discover available contacts/groups and their exact names.

@@ -1,0 +1,57 @@
+[project]
+name = "warchive"
+version = "0.1.0"
+description = "Read-only search of your own WhatsApp Desktop history (Windows): memory-recovered key, hybrid lexical+semantic search, CLI + MCP server."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "warchive contributors" }]
+keywords = ["whatsapp", "search", "forensics", "windows", "mcp", "read-only"]
+classifiers = [
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Communications :: Chat",
+    "Topic :: Utilities",
+    "Environment :: Console",
+]
+dependencies = [
+    "cryptography",   # AES-256-OFB page decryption
+    "python-bidi",    # RTL (Hebrew/Arabic) terminal display
+    "python-snappy",  # decompress LevelDB blocks (sender direction)
+]
+
+[project.optional-dependencies]
+# Semantic / cross-lingual search. GPU runtimes (onnxruntime-gpu / -directml)
+# are installed separately by the user — never a dependency here (see README).
+semantic = ["fastembed", "sqlite-vec", "numpy"]
+mcp = ["mcp"]
+all = ["fastembed", "sqlite-vec", "numpy", "mcp"]
+
+[project.scripts]
+warchive = "wa_search:main"
+warchive-mcp = "wa_mcp:main"
+
+[project.urls]
+Homepage = "https://github.com/digitaloracle/warchive"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# The tool is a set of top-level modules (not a package dir), so the existing
+# /wa skill and MCP launch paths keep working. List them explicitly for the wheel.
+[tool.hatch.build.targets.wheel]
+include = [
+    "wa_search.py",
+    "wa_normalize.py",
+    "wa_translit.py",
+    "wa_embed.py",
+    "wa_mcp.py",
+]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "wa_search.py", "wa_normalize.py", "wa_translit.py", "wa_embed.py", "wa_mcp.py",
+    "README.md", "DECRYPTION.md", "CHANGELOG.md", "TODO.md", "LICENSE",
+]
