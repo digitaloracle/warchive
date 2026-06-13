@@ -6,6 +6,9 @@
 #     "cryptography",
 #     "python-bidi",
 #     "python-snappy",
+#     "fastembed",
+#     "sqlite-vec",
+#     "numpy",
 # ]
 # ///
 """
@@ -49,52 +52,62 @@ def _direction(from_me) -> str:
 
 
 def _shape(r: dict) -> dict:
-    return {
+    out = {
         "timestamp": r["timestamp"],
         "direction": _direction(r.get("from_me")),
         "display":   r["display"],
         "chatId":    r["chatId"],
         "text":      r["text"],
     }
+    if r.get("snippet"):
+        out["snippet"] = r["snippet"]
+    if "is_match" in r:            # present only when context expansion was used
+        out["is_match"] = r["is_match"]
+    return out
 
 
 @mcp.tool()
 def search_messages(query: str = "", chat: str = "", phone: str = "",
-                    since: str = "", until: str = "", top_k: int = 200) -> dict[str, Any]:
+                    since: str = "", until: str = "", top_k: int = 200,
+                    mode: str = "hybrid", direction: str = "any",
+                    context: int = 0, recency: bool = False) -> dict[str, Any]:
     """Search WhatsApp Desktop chat history (read-only). All filters are optional
     and combine with AND.
 
     Args:
-        query: keyword(s) to find in message text. When set, results are BM25-ranked
-               by relevance (best first); otherwise most-recent first.
+        query: keyword(s) / phrase / concept to find. When set, results are
+               relevance-ranked; otherwise most-recent first.
         chat:  contact display name or JID fragment (case-insensitive substring).
-        phone: phone number, e.g. "+972501234567".
+        phone: phone number, e.g. "+15551234567".
         since: only messages on/after this date, "YYYY-MM-DD".
         until: only messages on/before this date (inclusive), "YYYY-MM-DD".
-        top_k: max messages to return (default 200). `total_matched` reports the
-               full match count so you know when more exist.
+        top_k: max messages to return (default 200).
+        mode:  "hybrid" (lexical + semantic, default), "lexical" (exact/keyword,
+               Hebrew-aware), or "semantic" (meaning/paraphrase, incl. Hebrew↔English).
+        direction: "any" (default), "me" (only messages you sent), or "them".
+        context: include this many messages before/after each hit (same chat) —
+               useful for reading a match in its conversational context.
+        recency: blend recency into ranking to favor newer matches.
 
-    Returns a dict: {total_matched, returned, messages:[{timestamp, direction,
-    display, chatId, text}]}. `direction` is "sent" | "received" | "unknown".
+    Returns: {returned, truncated, messages:[{timestamp, direction, display,
+    chatId, text, snippet}]}. `direction` is "sent" | "received" | "unknown";
+    `truncated` is true if more matches may exist beyond top_k.
     """
+    fm = {"me": True, "them": False}.get(direction, None)
     try:
-        full = wa_search.query_messages(
+        results = wa_search.query_messages(
             query=query or None, chat=chat or None, phone=phone or None,
-            since=since or None, until=until or None, top_k=None)
+            since=since or None, until=until or None, top_k=top_k,
+            mode=mode, from_me=fm, context=context, recency=recency)
     except ValueError:
         return {"error": "since/until must be in YYYY-MM-DD format"}
     except Exception as e:  # noqa: BLE001 — surface as structured error, never crash
         return _err(e)
 
-    total = len(full)
-    if top_k and total > top_k:
-        returned = full[:top_k] if query else full[-top_k:]
-    else:
-        returned = full
     return {
-        "total_matched": total,
-        "returned": len(returned),
-        "messages": [_shape(r) for r in returned],
+        "returned": len(results),
+        "truncated": bool(top_k and len(results) >= top_k and not context),
+        "messages": [_shape(r) for r in results],
     }
 
 

@@ -37,8 +37,9 @@ check("4 tools registered", names == ["list_chats", "refresh_cache", "search_mes
       str(names))
 
 # 3) search_messages shape + cap
-check("search_messages returns capped messages", res.get("returned", 0) <= 3 and "total_matched" in res,
-      f"returned={res.get('returned')} total={res.get('total_matched')}")
+check("search_messages returns capped messages",
+      res.get("returned", 0) <= 3 and "messages" in res and "truncated" in res,
+      f"returned={res.get('returned')} truncated={res.get('truncated')}")
 if res.get("messages"):
     m = res["messages"][0]
     check("message has expected keys",

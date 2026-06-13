@@ -37,10 +37,17 @@ async def main() -> int:
 
             res = await session.call_tool("search_messages", {"top_k": 2})
             sc = res.structuredContent
-            print("search returned:", sc.get("returned"), "of", sc.get("total_matched"),
-                  file=sys.stderr)
-            assert sc.get("returned", 0) <= 2 and sc.get("total_matched", 0) > 0
-            print("E2E stdio handshake: PASS", file=sys.stderr)
+            print("search returned:", sc.get("returned"), file=sys.stderr)
+            assert sc.get("returned", 0) <= 2 and "messages" in sc
+
+            # Semantic query loads the embedding model server-side; if its warnings
+            # leaked to stdout they'd corrupt the MCP stream and this would fail.
+            res2 = await session.call_tool(
+                "search_messages", {"query": "pizza", "mode": "semantic", "top_k": 3})
+            sc2 = res2.structuredContent
+            print("semantic returned:", sc2.get("returned"), file=sys.stderr)
+            assert "messages" in sc2 and "error" not in sc2
+            print("E2E stdio handshake (incl. semantic): PASS", file=sys.stderr)
             return 0
 
 

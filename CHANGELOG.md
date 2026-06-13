@@ -10,6 +10,30 @@ was sound; this round hardened everything around it.
 
 ### Added
 
+- **Hybrid retrieval — a major text-search upgrade.** The old path selected
+  candidates with SQL `LIKE` substring matching (so anything lost to a typo,
+  inflection, synonym, or Hebrew vowel-pointing was never retrieved), then ranked
+  with BM25. The new path:
+  - **FTS5 lexical index** over normalized, stemmed tokens (`message_fts`), ranked
+    by SQLite's native `bm25()`. New module **`wa_normalize.py`**: NFC, niqqud /
+    bidi-control stripping, Hebrew final-letter folding, and prefix **+ suffix**
+    stemming — so a Hebrew query matches inflected/prefixed forms it previously
+    missed. Prefix matching restores partial-word recall.
+  - **Semantic vector search** (new module **`wa_embed.py`**): local, offline
+    multilingual embeddings (`paraphrase-multilingual-MiniLM-L12-v2` via fastembed,
+    stored in `sqlite-vec`), catching paraphrase and **cross-lingual Hebrew↔English**
+    matches. Built once per mirror change into `wa_vec.db`.
+  - **Reciprocal Rank Fusion** of the lexical and semantic rankings (`--mode hybrid`,
+    default; also `lexical` / `semantic`). Degrades gracefully to lexical-only when
+    the embedding extras aren't installed (the bare pip CLI), so it never hard-fails.
+  - **Query expansion** (new module **`wa_translit.py`**): Hebrew↔Latin
+    transliteration variants widen recall for code-switched/transliterated terms.
+  - **Snippets, conversation-context expansion (`--context N`), `--mine`/`--theirs`
+    direction filter, and `--recency` ranking blend.** New MCP `search_messages`
+    params: `mode`, `direction`, `context`, `recency`.
+  - Mirror schema bumped to **v3** (adds the FTS index); existing mirrors rebuild
+    automatically. Refactor: `query_messages()`/`_mirror_search()` now do hybrid
+    retrieval; the `--no-mirror` direct path keeps the legacy substring+BM25 behavior.
 - **MCP server flavor (`wa_mcp.py`)** for Claude Desktop. Desktop's skill/code
   sandbox can't reach the running WhatsApp process; an MCP server runs as a normal
   host process outside that sandbox. Exposes four tools — `search_messages`,

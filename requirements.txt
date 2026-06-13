@@ -13,3 +13,11 @@ python-bidi         # correct RTL (Hebrew/Arabic) display in terminal output
 # code falls back to cramjam automatically (see wa_search.py, SECTION 6.6).
 python-snappy
 # cramjam           # alternative to python-snappy if it won't build on your machine
+
+# Optional — semantic ("meaning"/cross-lingual) search. Without these, search
+# still works in lexical mode (FTS5 + Hebrew-aware stemming); `--mode semantic`
+# and the semantic half of `--mode hybrid` are simply skipped. The MCP server
+# (wa_mcp.py) bundles these via uv already.
+# fastembed          # local multilingual embeddings (ONNX, no torch; ~0.22 GB model)
+# sqlite-vec         # vector index
+# numpy

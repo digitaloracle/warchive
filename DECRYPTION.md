@@ -405,10 +405,11 @@ mirror, `wa_mirror.db`, next to the script (SECTION 6.7):
 CREATE TABLE message(rowid, id, chatId, display, timestamp, ts_epoch, text, from_me);
 CREATE TABLE contact(phone, lid, name);   -- phone→LID resolution, no contacts.db decrypt
 CREATE TABLE meta(k, v);                  -- schema version + source watermark
+CREATE VIRTUAL TABLE message_fts USING fts5(norm, tokenize='unicode61');
 ```
 
-Display names and `from_me` are precomputed at build time, so queries are pure
-SQL + the existing BM25 re-rank.
+Display names and `from_me` are precomputed at build time, and `message_fts`
+holds the normalized/stemmed token stream (see §11), so queries are pure SQL.
 
 **Freshness** is a watermark = `(mtime, size)` of `genericStorage.db` and its WAL,
 stored in `meta`. On each run:
@@ -419,12 +420,32 @@ stored in `meta`. On each run:
   also when the `from_me` cache is refreshed, so new messages get direction data),
   then query.
 
-Filter semantics in the mirror path are kept byte-for-byte identical to the direct
-B-tree path (substring `LIKE` matching, not FTS tokenization, so partial-word and
-Hebrew queries match the same rows). Verify with `--no-mirror`:
-
 ```
-python wa_search.py --chat "Alice" --compact            # mirror
-python wa_search.py --chat "Alice" --compact --no-mirror # direct — identical output
 python wa_search.py --refresh                            # force a rebuild
+python wa_search.py --chat "Alice" --compact --no-mirror # legacy direct B-tree read
 ```
+
+---
+
+## 11. Retrieval (hybrid lexical + semantic)
+
+Search (mirror path, `SECTION 6.8`) combines two retrievers and fuses them:
+
+- **Lexical** — the `message_fts` FTS5 index, ranked by SQLite's `bm25()`. Both
+  the index and the query run through `wa_normalize` (NFC; strip niqqud and bidi
+  controls; fold Hebrew final letters; prefix **+ suffix** stemming), so inflected
+  Hebrew forms match. Query tokens are prefix-matched and OR'd; `wa_translit`
+  adds Hebrew↔Latin transliteration variants for code-switched terms.
+- **Semantic** — `wa_embed` embeds every message with a local multilingual model
+  (`paraphrase-multilingual-MiniLM-L12-v2` via fastembed, stored in `sqlite-vec`
+  at `wa_vec.db`) and retrieves by cosine similarity, catching paraphrase and
+  cross-lingual Hebrew↔English matches. Built once per mirror change; **optional**
+  (skipped if the embedding deps are absent).
+- **Fusion** — Reciprocal Rank Fusion (`1/(k+rank)`, k=60) merges the two ranked
+  lists (`--mode hybrid`). `--mode lexical` / `--mode semantic` select one.
+
+Non-text filters (chat/phone/date/`from_me`) constrain both retrievers. A `LIKE`
+substring fallback guarantees results are never empty when FTS finds nothing.
+`--context N` pulls neighbouring messages around each hit; `--recency` blends a
+recency ranking into the fusion. The `--no-mirror` path retains the original
+substring + Python-BM25 behavior for debugging/parity.

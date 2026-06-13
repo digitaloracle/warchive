@@ -39,6 +39,35 @@ except ImportError:
     def _rtl(text: str) -> str:  # type: ignore[misc]
         return text
 
+# ── Retrieval modules (local; degrade gracefully if absent) ─────────────────
+try:
+    import wa_normalize
+except Exception:                       # pragma: no cover
+    wa_normalize = None
+try:
+    import wa_translit
+except Exception:                       # pragma: no cover
+    wa_translit = None
+try:
+    import wa_embed                     # heavy deps are lazy-loaded inside it
+except Exception:                       # pragma: no cover
+    wa_embed = None
+
+
+def _norm(text):
+    """Normalize text for matching (niqqud/bidi/final-letter folding) if available."""
+    if wa_normalize:
+        return wa_normalize.normalize(text or "")
+    return (text or "").lower()
+
+
+def _norm_tokens(text):
+    """Tokenize+stem for the FTS index/query (Hebrew prefix+suffix aware) if available."""
+    if wa_normalize:
+        return wa_normalize.tokens(text or "")
+    return [w for w in re.findall(r"[֐-׿\w]+", (text or "").lower()) if len(w) >= 2]
+
+
 # ── Config ─────────────────────────────────────────────────────────────────
 SESSION_GLOB = (
     r"C:\Users\{user}\AppData\Local\Packages"
@@ -975,9 +1004,11 @@ def _get_fromme(msg_id):
 # and works even when WhatsApp is closed.
 
 _MIRROR_PATH           = os.path.join(_SCRIPT_DIR, "wa_mirror.db")
+_VEC_PATH              = os.path.join(_SCRIPT_DIR, "wa_vec.db")   # semantic index
 # Bump when the build logic changes in a way that invalidates existing mirrors.
 # v2: WAL salt-generation fix — v1 mirrors were truncated to a stale snapshot.
-_MIRROR_SCHEMA_VERSION = "2"
+# v3: added FTS5 (normalized/stemmed) index for lexical retrieval.
+_MIRROR_SCHEMA_VERSION = "3"
 
 
 def _source_watermark(session_dir):
@@ -1052,26 +1083,39 @@ def _build_mirror(session_dir, verbose=False):
         CREATE INDEX idx_msg_chat ON message(chatId);
         CREATE TABLE contact(phone TEXT PRIMARY KEY, lid TEXT, name TEXT);
         CREATE TABLE meta(k TEXT PRIMARY KEY, v TEXT);
+        -- Lexical index over normalized + stemmed tokens (Hebrew-aware). The
+        -- 'norm' column holds whitespace-joined wa_normalize.tokens(text), so
+        -- FTS token matches align with the same stemming used at query time.
+        CREATE VIRTUAL TABLE message_fts USING fts5(norm, tokenize='unicode61');
     """)
 
-    batch = []
+    def _msg_insert(rows):
+        con.executemany("INSERT OR REPLACE INTO message VALUES (?,?,?,?,?,?,?,?)", rows)
+
+    def _fts_insert(rows):
+        con.executemany("INSERT INTO message_fts(rowid, norm) VALUES (?,?)", rows)
+
+    batch, fts_batch = [], []
     n = 0
     for msg in iter_messages(session_dir, verbose=verbose, need_contacts_key=False):
         chat_id = msg.get("chatId") or ""
         mid     = msg.get("id", "")
+        rowid   = msg.get("_rowid")
+        text    = msg.get("text") or ""
         fm      = _get_fromme(mid)
         batch.append((
-            msg.get("_rowid"), str(mid), chat_id, _disp(chat_id),
+            rowid, str(mid), chat_id, _disp(chat_id),
             _ts_to_str(msg.get("timestamp")), _ts_to_epoch(msg.get("timestamp")),
-            msg.get("text") or "",
+            text,
             1 if fm is True else 0 if fm is False else None,
         ))
+        fts_batch.append((rowid, " ".join(_norm_tokens(text))))
         n += 1
         if len(batch) >= 5000:
-            con.executemany("INSERT OR REPLACE INTO message VALUES (?,?,?,?,?,?,?,?)", batch)
-            batch.clear()
+            _msg_insert(batch); _fts_insert(fts_batch)
+            batch.clear(); fts_batch.clear()
     if batch:
-        con.executemany("INSERT OR REPLACE INTO message VALUES (?,?,?,?,?,?,?,?)", batch)
+        _msg_insert(batch); _fts_insert(fts_batch)
 
     pm = _cached_phone_map or {}
     pn = _cached_phone_names or {}
@@ -1089,6 +1133,13 @@ def _build_mirror(session_dir, verbose=False):
     os.replace(tmp, _MIRROR_PATH)
     if verbose:
         print(f"[mirror] built {n} messages -> {_MIRROR_PATH}", file=sys.stderr)
+
+    # Build the semantic vector index too, if embeddings are available (optional).
+    try:
+        _ensure_vec_index(verbose=verbose)
+    except Exception as e:                                   # pragma: no cover
+        if verbose:
+            print(f"[vec] index build skipped ({e})", file=sys.stderr)
 
 
 def _ensure_mirror(session_dir, force=False, verbose=False):
@@ -1126,48 +1177,249 @@ def _mirror_list_chats():
     return rows
 
 
-def _mirror_search(lid_filter, phone_filter, chat_lower, query_terms,
-                   since_epoch, until_epoch):
-    """Query the mirror with the same filter semantics as the direct B-tree path."""
+# ── Hybrid retrieval: lexical FTS5 + semantic vectors, fused with RRF ────────
+
+def _ensure_vec_index(verbose=False):
+    """Build/refresh the semantic vector index from the mirror, if embeddings are
+    available. Cached by the mirror's watermark. Returns True if usable."""
+    if not (wa_embed and getattr(wa_embed, "EMBED_AVAILABLE", False)):
+        return False
+    try:
+        con = sqlite3.connect(_MIRROR_PATH)
+        wm = con.execute("SELECT v FROM meta WHERE k='watermark'").fetchone()
+    except sqlite3.Error:
+        return False
+    watermark = (wm[0] if wm else "") + "|" + _MIRROR_SCHEMA_VERSION
+    fp_path = _VEC_PATH + ".fp"
+    have_fp = open(fp_path, encoding="utf-8").read() if os.path.exists(fp_path) else None
+    if have_fp == watermark and wa_embed.index_count(_VEC_PATH) > 0:
+        con.close()
+        return True
+    if verbose:
+        print("[vec] building semantic index (one-time per mirror change)...",
+              file=sys.stderr)
+    rows = con.execute(
+        "SELECT rowid, text FROM message WHERE text IS NOT NULL AND text <> ''"
+    ).fetchall()
+    con.close()
+    wa_embed.build_index(rows, _VEC_PATH, verbose=verbose)
+    try:
+        with open(fp_path, "w", encoding="utf-8") as f:
+            f.write(watermark)
+    except OSError:
+        pass
+    return True
+
+
+def _filter_clause(lid_filter, chat_lower, since_epoch, until_epoch, from_me, alias=""):
+    """SQL WHERE fragment + params for the non-text filters (optionally aliased)."""
+    a = (alias + ".") if alias else ""
     where, params = [], []
     if since_epoch:
-        where.append("ts_epoch >= ?"); params.append(since_epoch)
+        where.append(f"{a}ts_epoch >= ?"); params.append(since_epoch)
     if until_epoch:
-        where.append("ts_epoch <= ?"); params.append(until_epoch)
+        where.append(f"{a}ts_epoch <= ?"); params.append(until_epoch)
     if lid_filter:
-        where.append("chatId LIKE ?"); params.append(lid_filter + "@%")
+        where.append(f"{a}chatId LIKE ?"); params.append(lid_filter + "@%")
     if chat_lower:
-        where.append("(LOWER(display) LIKE ? OR LOWER(chatId) LIKE ?)")
+        where.append(f"(LOWER({a}display) LIKE ? OR LOWER({a}chatId) LIKE ?)")
         params += ["%" + chat_lower + "%", "%" + chat_lower + "%"]
-    if query_terms:
-        where.append("(" + " OR ".join(["LOWER(text) LIKE ?"] * len(query_terms)) + ")")
-        params += ["%" + t + "%" for t in query_terms]
+    if from_me is True:
+        where.append(f"{a}from_me = 1")
+    elif from_me is False:
+        where.append(f"{a}from_me = 0")
+    return (" AND ".join(where), params)
 
-    sql = ("SELECT id, chatId, display, timestamp, ts_epoch, text, from_me "
-           "FROM message")
-    if where:
-        sql += " WHERE " + " AND ".join(where)
 
+def _fts_match(query_text):
+    """FTS5 MATCH string from normalized+expanded query tokens (prefix, OR'd)."""
+    variants = [query_text]
+    if wa_translit:
+        try:
+            variants = wa_translit.expand_query(query_text) or [query_text]
+        except Exception:
+            pass
+    terms, seen = [], set()
+    for v in variants:
+        for t in _norm_tokens(v):
+            t = re.sub(r"[^\w֐-׿]", "", t)        # keep only token chars (FTS-safe)
+            if len(t) >= 2 and t not in seen:
+                seen.add(t); terms.append(t)
+    return " OR ".join(t + "*" for t in terms)    # prefix match for partial-word recall
+
+
+def _allowed_ids(con, fwhere, fparams):
+    """Rowid set permitted by the non-text filters (None == no restriction)."""
+    if not fwhere:
+        return None
+    return {r[0] for r in con.execute(
+        "SELECT rowid FROM message WHERE " + fwhere, fparams)}
+
+
+def _fts_search(con, query_text, fwhere_m, fparams_m, limit):
+    """Lexical candidate rowids, best-first by bm25."""
+    match = _fts_match(query_text)
+    if not match:
+        return []
+    sql = ["SELECT message_fts.rowid FROM message_fts"]
+    params = [match]
+    if fwhere_m:
+        sql.append("JOIN message m ON m.rowid = message_fts.rowid")
+    sql.append("WHERE message_fts MATCH ?")
+    if fwhere_m:
+        sql.append("AND " + fwhere_m); params += fparams_m
+    sql.append("ORDER BY bm25(message_fts) LIMIT ?"); params.append(limit)
+    try:
+        return [r[0] for r in con.execute(" ".join(sql), params)]
+    except sqlite3.Error:
+        return []
+
+
+def _semantic_ids(query_text, allowed, limit):
+    """Semantic candidate rowids, best-first; [] if embeddings unavailable."""
+    if not (wa_embed and getattr(wa_embed, "EMBED_AVAILABLE", False)):
+        return []
+    try:
+        if not _ensure_vec_index():
+            return []
+        hits = wa_embed.search(query_text, _VEC_PATH, top_k=limit)
+    except Exception:
+        return []
+    ids = [rid for rid, _score in hits]
+    if allowed is not None:
+        ids = [r for r in ids if r in allowed]
+    return ids
+
+
+def _rrf(rankings, k=60):
+    """Reciprocal Rank Fusion of best-first rowid lists -> fused order."""
+    scores = {}
+    for ranking in rankings:
+        for i, rid in enumerate(ranking):
+            scores[rid] = scores.get(rid, 0.0) + 1.0 / (k + i + 1)
+    return sorted(scores, key=lambda r: -scores[r])
+
+
+def _like_fallback(con, query_terms, fwhere, fparams, limit):
+    """Old substring matcher — safety net so we never regress to zero hits."""
+    if not query_terms:
+        return []
+    where = ["(" + " OR ".join(["LOWER(text) LIKE ?"] * len(query_terms)) + ")"]
+    params = ["%" + t + "%" for t in query_terms]
+    if fwhere:
+        where.append(fwhere); params += fparams
+    params.append(limit)
+    return [r[0] for r in con.execute(
+        "SELECT rowid FROM message WHERE " + " AND ".join(where)
+        + " ORDER BY ts_epoch DESC LIMIT ?", params)]
+
+
+def _snippet(text, query_text, width=160):
+    """Short excerpt of the original text around the first matched query word."""
+    if not text:
+        return ""
+    low = text.lower()
+    terms = [t for t in re.split(r"\s+", (query_text or "").lower().strip())
+             if len(t) >= 2]
+    pos = min((low.find(t) for t in terms if t in low), default=-1)
+    if pos < 0:
+        s = text[:width].replace("\n", " ")
+        return s + ("…" if len(text) > width else "")
+    start = max(0, pos - width // 3)
+    end = min(len(text), start + width)
+    return (("…" if start > 0 else "")
+            + text[start:end].replace("\n", " ")
+            + ("…" if end < len(text) else ""))
+
+
+def _row_to_result(r, query_text=""):
+    fm = r["from_me"]
+    return {
+        "_rowid":    r["rowid"],
+        "id":        r["id"],
+        "chatId":    r["chatId"],
+        "display":   r["display"],
+        "timestamp": r["timestamp"],
+        "ts_epoch":  r["ts_epoch"],
+        "text":      r["text"],
+        "from_me":   True if fm == 1 else False if fm == 0 else None,
+        "snippet":   _snippet(r["text"], query_text) if query_text else "",
+    }
+
+
+def _fetch_rows(con, rowids):
+    """Fetch message rows for an ordered rowid list, preserving that order."""
+    if not rowids:
+        return []
+    qmarks = ",".join("?" * len(rowids))
+    by_id = {r["rowid"]: r for r in con.execute(
+        "SELECT rowid,id,chatId,display,timestamp,ts_epoch,text,from_me "
+        f"FROM message WHERE rowid IN ({qmarks})", rowids)}
+    return [by_id[rid] for rid in rowids if rid in by_id]
+
+
+def _mirror_search(lid_filter, phone_filter, chat_lower, query_terms,
+                   since_epoch, until_epoch, *, query_text="", mode="hybrid",
+                   from_me=None, top_k=None, recency=False):
+    """Hybrid retrieval over the mirror: lexical FTS5 + semantic vectors, fused.
+
+    No query text -> filtered, chronological listing (legacy behavior). With a
+    query, candidates come from FTS (bm25) and — when embeddings are available
+    and mode allows — the vector index, fused with Reciprocal Rank Fusion.
+    mode ∈ {hybrid, lexical, semantic}."""
     con = sqlite3.connect(_MIRROR_PATH)
     con.row_factory = sqlite3.Row
-    results = []
-    for r in con.execute(sql, params):
-        if phone_filter:   # digits-in-JID fallback (rare; parity with direct path)
-            num = "".join(c for c in r["chatId"] if c.isdigit())
-            if phone_filter not in num:
-                continue
-        fm = r["from_me"]
-        results.append({
-            "id":        r["id"],
-            "chatId":    r["chatId"],
-            "display":   r["display"],
-            "timestamp": r["timestamp"],
-            "ts_epoch":  r["ts_epoch"],
-            "text":      r["text"],
-            "from_me":   True if fm == 1 else False if fm == 0 else None,
-        })
+
+    def _phone_ok(r):
+        if not phone_filter:
+            return True
+        return phone_filter in "".join(c for c in r["chatId"] if c.isdigit())
+
+    fwhere, fparams = _filter_clause(lid_filter, chat_lower, since_epoch,
+                                     until_epoch, from_me)
+
+    if not (query_text and query_text.strip()):
+        sql = "SELECT rowid,id,chatId,display,timestamp,ts_epoch,text,from_me FROM message"
+        if fwhere:
+            sql += " WHERE " + fwhere
+        sql += " ORDER BY ts_epoch"
+        rows = [r for r in con.execute(sql, fparams) if _phone_ok(r)]
+        if top_k:
+            rows = rows[-top_k:]
+        con.close()
+        return [_row_to_result(r) for r in rows]
+
+    pool = max((top_k or 200) * 5, 500)
+    fwhere_m, fparams_m = _filter_clause(lid_filter, chat_lower, since_epoch,
+                                         until_epoch, from_me, alias="m")
+    lex = _fts_search(con, query_text, fwhere_m, fparams_m, pool) \
+        if mode in ("hybrid", "lexical") else []
+    sem = _semantic_ids(query_text, _allowed_ids(con, fwhere, fparams), pool) \
+        if mode in ("hybrid", "semantic") else []
+
+    if mode == "lexical":
+        ranked = lex
+    elif mode == "semantic":
+        ranked = sem or lex                       # degrade to lexical if no embeddings
+    else:
+        lists = [x for x in (lex, sem) if x]
+        ranked = _rrf(lists) if len(lists) > 1 else (lists[0] if lists else [])
+
+    if not ranked:                                # safety net: old substring matcher
+        ranked = _like_fallback(con, query_terms, fwhere, fparams, pool)
+
+    if recency and ranked:
+        qm = ",".join("?" * len(ranked))
+        tsmap = {r[0]: r[1] for r in con.execute(
+            f"SELECT rowid, ts_epoch FROM message WHERE rowid IN ({qm})", ranked)}
+        recency_rank = sorted(ranked, key=lambda rid: -tsmap.get(rid, 0))
+        ranked = _rrf([ranked, recency_rank])
+
+    rows = [r for r in _fetch_rows(con, ranked) if _phone_ok(r)]
+    if top_k:
+        rows = rows[:top_k]
     con.close()
-    return results
+    return [_row_to_result(r, query_text) for r in rows]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1252,13 +1504,16 @@ def _ensure_mirror_soft(session_dir, refresh, verbose):
 
 
 def query_messages(query=None, chat=None, phone=None, since=None, until=None,
-                   top_k=None, *, session_dir=None, use_mirror=True,
+                   top_k=None, *, mode="hybrid", from_me=None, context=0,
+                   recency=False, session_dir=None, use_mirror=True,
                    refresh=False, verbose=False):
     """Search WhatsApp messages and return a list of result dicts:
-    {id, chatId, display, timestamp, ts_epoch, text, from_me}.
+    {id, chatId, display, timestamp, ts_epoch, text, from_me, snippet, _rowid}.
 
     `since`/`until` are 'YYYY-MM-DD' strings (ValueError on bad format).
-    Shared by the CLI (`main`) and the MCP server (`wa_mcp.py`)."""
+    `mode` ∈ {hybrid, lexical, semantic} (mirror path). `from_me` True/False/None
+    filters by direction. `context` adds N neighbouring messages around each hit.
+    `recency` blends recency into ranking. Shared by the CLI and the MCP server."""
     session_dir = session_dir or _find_session_dir()
     if use_mirror:
         use_mirror = _ensure_mirror_soft(session_dir, refresh, verbose)
@@ -1294,46 +1549,57 @@ def query_messages(query=None, chat=None, phone=None, since=None, until=None,
     query_terms = [t for t in re.split(r"\s+", query.lower().strip()) if t] if query else []
 
     if use_mirror:
-        results = _mirror_search(lid_filter, phone_filter, chat_lower,
-                                 query_terms, since_epoch, until_epoch)
-    else:
-        if chat:
-            _load_phone_map(session_dir, verbose=verbose)
-        display_map = _build_display_map()
-        results = []
-        for msg in iter_messages(session_dir, verbose=verbose,
-                                 need_contacts_key=bool(phone or chat)):
-            text    = msg.get("text") or ""
-            chat_id = msg.get("chatId") or ""
-            ts_ep   = _ts_to_epoch(msg.get("timestamp"))
-            if query_terms:
-                tl = text.lower()
-                if not any(t in tl for t in query_terms):
-                    continue
-            if lid_filter:
-                if not chat_id.startswith(lid_filter + "@"):
-                    continue
-            elif phone_filter:
-                num = "".join(c for c in chat_id if c.isdigit())
-                if phone_filter not in num:
-                    continue
-            if chat_lower:
-                disp = _resolve_display(chat_id, display_map).lower()
-                if chat_lower not in disp and chat_lower not in chat_id.lower():
-                    continue
-            if since_epoch and ts_ep < since_epoch:
+        results = _mirror_search(
+            lid_filter, phone_filter, chat_lower, query_terms,
+            since_epoch, until_epoch, query_text=query or "", mode=mode,
+            from_me=from_me, top_k=top_k, recency=recency)
+        if context and query and query.strip():
+            results = _expand_context(results, context)
+        return results   # mirror results are already ranked + capped
+
+    # Direct (no-mirror) fallback — substring + BM25, kept for parity/debugging.
+    if chat:
+        _load_phone_map(session_dir, verbose=verbose)
+    display_map = _build_display_map()
+    results = []
+    for msg in iter_messages(session_dir, verbose=verbose,
+                             need_contacts_key=bool(phone or chat)):
+        text    = msg.get("text") or ""
+        chat_id = msg.get("chatId") or ""
+        ts_ep   = _ts_to_epoch(msg.get("timestamp"))
+        if query_terms:
+            tl = text.lower()
+            if not any(t in tl for t in query_terms):
                 continue
-            if until_epoch and ts_ep > until_epoch:
+        if lid_filter:
+            if not chat_id.startswith(lid_filter + "@"):
                 continue
-            results.append({
-                "id":        msg.get("id", ""),
-                "chatId":    chat_id,
-                "display":   _resolve_display(chat_id, display_map),
-                "timestamp": _ts_to_str(msg.get("timestamp")),
-                "ts_epoch":  ts_ep,
-                "text":      text,
-                "from_me":   _get_fromme(msg.get("id")),
-            })
+        elif phone_filter:
+            num = "".join(c for c in chat_id if c.isdigit())
+            if phone_filter not in num:
+                continue
+        if chat_lower:
+            disp = _resolve_display(chat_id, display_map).lower()
+            if chat_lower not in disp and chat_lower not in chat_id.lower():
+                continue
+        if since_epoch and ts_ep < since_epoch:
+            continue
+        if until_epoch and ts_ep > until_epoch:
+            continue
+        fmv = _get_fromme(msg.get("id"))
+        if from_me is True and fmv is not True:
+            continue
+        if from_me is False and fmv is not False:
+            continue
+        results.append({
+            "id":        msg.get("id", ""),
+            "chatId":    chat_id,
+            "display":   _resolve_display(chat_id, display_map),
+            "timestamp": _ts_to_str(msg.get("timestamp")),
+            "ts_epoch":  ts_ep,
+            "text":      text,
+            "from_me":   fmv,
+        })
 
     results.sort(key=lambda r: r["ts_epoch"])
     if query and results:
@@ -1341,6 +1607,40 @@ def query_messages(query=None, chat=None, phone=None, since=None, until=None,
     elif top_k:
         results = results[-top_k:]
     return results
+
+
+def _expand_context(hits, n):
+    """Add up to n messages before/after each hit within the same chat, marking
+    which rows are matches. Returns chat-grouped chronological order. Bounded:
+    only the first 40 hits are expanded to avoid context blow-ups."""
+    if not hits:
+        return hits
+    hit_keys = {(h["chatId"], h["_rowid"]) for h in hits if h.get("_rowid") is not None}
+    out = {}
+    con = sqlite3.connect(_MIRROR_PATH)
+    con.row_factory = sqlite3.Row
+    for h in hits:
+        out[(h["chatId"], h.get("_rowid"))] = h
+    expandable = [h for h in hits if h.get("_rowid") is not None][:40]
+    for h in expandable:
+        cid, rid = h["chatId"], h["_rowid"]
+        neigh = con.execute(
+            "SELECT rowid,id,chatId,display,timestamp,ts_epoch,text,from_me FROM ("
+            "  SELECT * FROM message WHERE chatId=? AND rowid<=? ORDER BY rowid DESC LIMIT ?"
+            ") UNION "
+            "SELECT rowid,id,chatId,display,timestamp,ts_epoch,text,from_me FROM ("
+            "  SELECT * FROM message WHERE chatId=? AND rowid>? ORDER BY rowid ASC LIMIT ?"
+            ")", (cid, rid, n + 1, cid, rid, n)).fetchall()
+        for r in neigh:
+            key = (r["chatId"], r["rowid"])
+            if key not in out:
+                out[key] = _row_to_result(r)
+    con.close()
+    merged = list(out.values())
+    for m in merged:
+        m["is_match"] = (m["chatId"], m.get("_rowid")) in hit_keys
+    merged.sort(key=lambda r: (r["chatId"], r["ts_epoch"]))
+    return merged
 
 
 def get_chats(*, session_dir=None, use_mirror=True, refresh=False, verbose=False):
@@ -1418,6 +1718,18 @@ def main():
                     help="Force-rebuild the plaintext mirror from the encrypted source")
     ap.add_argument("--no-mirror",   action="store_true",
                     help="Bypass the plaintext mirror and read the encrypted DB directly")
+    ap.add_argument("--mode",        choices=["hybrid", "lexical", "semantic"],
+                    default="hybrid",
+                    help="Retrieval mode for keyword queries (default: hybrid "
+                         "lexical+semantic; semantic needs the embedding extras)")
+    ap.add_argument("--mine",        action="store_true",
+                    help="Only messages you sent")
+    ap.add_argument("--theirs",      action="store_true",
+                    help="Only messages you received")
+    ap.add_argument("--context",     metavar="N", type=int, default=0,
+                    help="Include N messages before/after each hit (same chat)")
+    ap.add_argument("--recency",     action="store_true",
+                    help="Blend recency into ranking (favor newer matches)")
     ap.add_argument("--verbose",     action="store_true")
     args = ap.parse_args()
 
@@ -1475,12 +1787,14 @@ def main():
                       f"last {last:16s}  [{c['jid']}]")
         return
 
+    from_me = True if args.mine else False if args.theirs else None
     try:
         results = query_messages(
             query=args.query, chat=args.chat, phone=args.phone,
             since=args.since, until=args.until, top_k=args.top_k,
-            session_dir=args.session_dir, use_mirror=use_mirror,
-            refresh=args.refresh, verbose=args.verbose)
+            mode=args.mode, from_me=from_me, context=args.context,
+            recency=args.recency, session_dir=args.session_dir,
+            use_mirror=use_mirror, refresh=args.refresh, verbose=args.verbose)
     except ValueError:
         sys.exit("--since / --until must be YYYY-MM-DD")
 

@@ -32,9 +32,14 @@ before publishing.
 
 ## Features
 
-- **Full-text search** with BM25 relevance ranking and Hebrew morphological
-  stemming (handles RTL display correctly).
-- **Filters:** by contact (display name, phone, or LID), by date range, top-N.
+- **Hybrid search** — lexical full-text (SQLite FTS5 + BM25, with Hebrew-aware
+  normalization and prefix/suffix stemming) fused via Reciprocal Rank Fusion with
+  **local semantic vector search** for paraphrase and cross-lingual Hebrew↔English
+  matches. Modes: `hybrid` (default), `lexical`, `semantic`. Semantic is optional
+  and degrades gracefully when its extras aren't installed.
+- **Filters:** by contact (display name, phone, or LID), by date range, by
+  direction (`--mine` / `--theirs`), top-N. `--context N` shows messages around
+  each hit; `--recency` favors newer matches.
 - **Sender direction** (`sent` / `received`) for ~half of messages, recovered
   from the WhatsApp IndexedDB LevelDB store.
 - **Exports:** JSON, CSV, a styled HTML transcript, or token-efficient one-line
@@ -87,9 +92,24 @@ python wa_search.py --chat "Alice" --html > alice.html
 
 # List all chats by message count (with last-message time)
 python wa_search.py --list-chats
+
+# Search modes & retrieval options
+python wa_search.py "renting an apartment" --mode semantic   # meaning, cross-lingual
+python wa_search.py "pizza" --mode lexical                   # exact/keyword (Hebrew-aware)
+python wa_search.py "pizza" --mine                           # only messages you sent
+python wa_search.py "pizza" --context 2                      # 2 messages of context each side
+python wa_search.py "pizza" --recency                        # favor newer matches
 ```
 
 Run `python wa_search.py -h` for all flags.
+
+> **Search modes.** `--mode hybrid` (default) fuses keyword (FTS5/BM25, with
+> Hebrew normalization + stemming) and semantic vector search via Reciprocal Rank
+> Fusion. `--mode semantic` finds matches by meaning (paraphrases, Hebrew↔English);
+> `--mode lexical` is exact keyword only. Semantic search needs the optional
+> embedding extras (`fastembed`, `sqlite-vec`, `numpy`); without them, the tool
+> stays in lexical mode automatically. The MCP server bundles those extras, so
+> Claude Desktop always gets full hybrid search.
 
 ## How it works (key recovery, salt, and decryption)
 
@@ -205,6 +225,9 @@ then ask it to *"search my WhatsApp for …"*. If a tool errors, ask it to run
 | Path | What |
 |---|---|
 | `wa_search.py` | the CLI tool + shared query API |
+| `wa_normalize.py` | Unicode/Hebrew normalization + stemming (stdlib) |
+| `wa_embed.py` | local semantic embedding index (optional, via uv) |
+| `wa_translit.py` | Hebrew↔Latin transliteration / query expansion (stdlib) |
 | `wa_mcp.py` | MCP server flavor for Claude Desktop (run via uv) |
 | `wa_mcp.py.lock` | uv lockfile for the MCP server's dependencies |
 | `DECRYPTION.md` | full technical write-up |

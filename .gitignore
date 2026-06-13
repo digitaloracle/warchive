@@ -4,8 +4,8 @@
 # ─── Personal data caches (machine-specific, regenerated on demand) ───────────
 _fromme_cache.json
 .wa_contact_cache.json
-wa_mirror.db
-wa_mirror.db-*
+wa_mirror.db*
+wa_vec.db*
 
 # ─── Research artifacts & abandoned approaches (contain keys / real data) ─────
 archive/
