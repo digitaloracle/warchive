@@ -62,6 +62,8 @@ def _shape(r: dict) -> dict:
     }
     if r.get("snippet"):
         out["snippet"] = r["snippet"]
+    if r.get("sender_name") or r.get("sender"):   # group-message sender, when known
+        out["sender"] = r.get("sender_name") or r.get("sender")
     if "is_match" in r:            # present only when context expansion was used
         out["is_match"] = r["is_match"]
     return out

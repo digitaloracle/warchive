@@ -844,6 +844,41 @@ def _ldb_extract(key_str, val):
     return row_id, from_me
 
 
+def _v8_str(data, off):
+    """Read a V8 one-byte string (tag 0x22 + len byte + bytes). (text, next_off)."""
+    if off >= len(data) or data[off] != 0x22 or off + 1 >= len(data):
+        return None, off
+    ln = data[off + 1]
+    return data[off + 2:off + 2 + ln].decode("utf-8", "replace"), off + 2 + ln
+
+
+_AUTHOR_MARK = b'\x22\x06author\x6f'   # "author" key (0x22,len6,"author") + object 'o'
+
+
+def _ldb_author(val):
+    """Sender JID for a group message (e.g. '170…@lid'), parsed from the `author`
+    JID-object in the V8 value. None for 1:1 messages (author is undefined there)."""
+    i = val.find(_AUTHOR_MARK)
+    if i < 0:
+        return None
+    j = i + len(_AUTHOR_MARK)
+    server = user = None
+    for _ in range(10):                    # walk a few key/value string pairs
+        key, j = _v8_str(val, j)
+        if key is None:
+            break
+        v, j = _v8_str(val, j)
+        if v is None:
+            break
+        if key == "server":
+            server = v
+        elif key == "user":
+            user = v
+        if user and server:
+            break
+    return f"{user}@{server}" if (user and server) else None
+
+
 def _ldb_walk_block(block):
     if len(block) < 8:
         return
@@ -936,7 +971,8 @@ def _ldb_walk_log(raw):
 
 
 def _build_fromme_cache():
-    """Scan LevelDB files and return {str(row_id): bool} dict."""
+    """Scan LevelDB and return {str(row_id): {"fm": bool, "snd": jid|None}}.
+    `fm` is the message direction; `snd` is the group sender JID (None for 1:1)."""
     if not os.path.isdir(_LDB_DIR):
         return {}
     result = {}
@@ -967,7 +1003,7 @@ def _build_fromme_cache():
             if r is None:
                 continue
             row_id, from_me = r
-            result[str(row_id)] = from_me
+            result[str(row_id)] = {"fm": from_me, "snd": _ldb_author(val)}
     return result
 
 
@@ -996,9 +1032,18 @@ def _get_fromme(msg_id):
     """Return True (outgoing), False (incoming), or None (unknown)."""
     if not msg_id:
         return None
-    cache = _load_fromme_cache()
-    val = cache.get(str(msg_id))
-    return val  # None if not found
+    val = _load_fromme_cache().get(str(msg_id))
+    if isinstance(val, dict):       # current format {"fm":..,"snd":..}
+        return val.get("fm")
+    return val                      # legacy flat format (bool) or None
+
+
+def _get_sender(msg_id):
+    """Return the group sender JID for a message, or None (1:1 / unknown / legacy)."""
+    if not msg_id:
+        return None
+    val = _load_fromme_cache().get(str(msg_id))
+    return val.get("snd") if isinstance(val, dict) else None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1017,7 +1062,8 @@ _VEC_PATH              = os.path.join(_DATA_DIR, "wa_vec.db")   # semantic index
 # Bump when the build logic changes in a way that invalidates existing mirrors.
 # v2: WAL salt-generation fix — v1 mirrors were truncated to a stale snapshot.
 # v3: added FTS5 (normalized/stemmed) index for lexical retrieval.
-_MIRROR_SCHEMA_VERSION = "3"
+# v4: added sender / sender_name columns (group-member attribution).
+_MIRROR_SCHEMA_VERSION = "4"
 # Separate from the mirror schema: the embedding index only needs rebuilding when
 # the *embedding* logic changes, not when we add SQL columns. Keeping this
 # independent means a mirror schema bump no longer forces a full re-embed.
@@ -1091,7 +1137,8 @@ def _build_mirror(session_dir, verbose=False):
     con = sqlite3.connect(tmp)
     con.executescript("""
         CREATE TABLE message(rowid INTEGER PRIMARY KEY, id TEXT, chatId TEXT,
-            display TEXT, timestamp TEXT, ts_epoch INTEGER, text TEXT, from_me INTEGER);
+            display TEXT, timestamp TEXT, ts_epoch INTEGER, text TEXT, from_me INTEGER,
+            sender TEXT, sender_name TEXT);
         CREATE INDEX idx_msg_ts   ON message(ts_epoch);
         CREATE INDEX idx_msg_chat ON message(chatId);
         CREATE TABLE contact(phone TEXT PRIMARY KEY, lid TEXT, name TEXT);
@@ -1103,7 +1150,8 @@ def _build_mirror(session_dir, verbose=False):
     """)
 
     def _msg_insert(rows):
-        con.executemany("INSERT OR REPLACE INTO message VALUES (?,?,?,?,?,?,?,?)", rows)
+        con.executemany(
+            "INSERT OR REPLACE INTO message VALUES (?,?,?,?,?,?,?,?,?,?)", rows)
 
     def _fts_insert(rows):
         con.executemany("INSERT INTO message_fts(rowid, norm) VALUES (?,?)", rows)
@@ -1116,11 +1164,13 @@ def _build_mirror(session_dir, verbose=False):
         rowid   = msg.get("_rowid")
         text    = msg.get("text") or ""
         fm      = _get_fromme(mid)
+        snd     = _get_sender(mid) if chat_id.endswith("@g.us") else None
         batch.append((
             rowid, str(mid), chat_id, _disp(chat_id),
             _ts_to_str(msg.get("timestamp")), _ts_to_epoch(msg.get("timestamp")),
             text,
             1 if fm is True else 0 if fm is False else None,
+            snd, (_disp(snd) if snd else None),
         ))
         fts_batch.append((rowid, " ".join(_norm_tokens(text))))
         n += 1
@@ -1371,6 +1421,8 @@ def _row_to_result(r, query_text=""):
         "ts_epoch":  r["ts_epoch"],
         "text":      r["text"],
         "from_me":   True if fm == 1 else False if fm == 0 else None,
+        "sender":    (r["sender"] if "sender" in r.keys() else None),
+        "sender_name": (r["sender_name"] if "sender_name" in r.keys() else None),
         "snippet":   _snippet(r["text"], query_text) if query_text else "",
     }
 
@@ -1381,7 +1433,7 @@ def _fetch_rows(con, rowids):
         return []
     qmarks = ",".join("?" * len(rowids))
     by_id = {r["rowid"]: r for r in con.execute(
-        "SELECT rowid,id,chatId,display,timestamp,ts_epoch,text,from_me "
+        "SELECT rowid,id,chatId,display,timestamp,ts_epoch,text,from_me,sender,sender_name "
         f"FROM message WHERE rowid IN ({qmarks})", rowids)}
     return [by_id[rid] for rid in rowids if rid in by_id]
 
@@ -1450,7 +1502,7 @@ def _mirror_search(lid_filter, phone_filter, chat_lower, query_terms,
                                      until_epoch, from_me)
 
     if not (query_text and query_text.strip()):
-        sql = "SELECT rowid,id,chatId,display,timestamp,ts_epoch,text,from_me FROM message"
+        sql = "SELECT rowid,id,chatId,display,timestamp,ts_epoch,text,from_me,sender,sender_name FROM message"
         if fwhere:
             sql += " WHERE " + fwhere
         sql += " ORDER BY ts_epoch"
@@ -1810,10 +1862,10 @@ def _expand_context(hits, n):
     for h in expandable:
         cid, rid = h["chatId"], h["_rowid"]
         neigh = con.execute(
-            "SELECT rowid,id,chatId,display,timestamp,ts_epoch,text,from_me FROM ("
+            "SELECT rowid,id,chatId,display,timestamp,ts_epoch,text,from_me,sender,sender_name FROM ("
             "  SELECT * FROM message WHERE chatId=? AND rowid<=? ORDER BY rowid DESC LIMIT ?"
             ") UNION "
-            "SELECT rowid,id,chatId,display,timestamp,ts_epoch,text,from_me FROM ("
+            "SELECT rowid,id,chatId,display,timestamp,ts_epoch,text,from_me,sender,sender_name FROM ("
             "  SELECT * FROM message WHERE chatId=? AND rowid>? ORDER BY rowid ASC LIMIT ?"
             ")", (cid, rid, n + 1, cid, rid, n)).fetchall()
         for r in neigh:
@@ -2042,7 +2094,10 @@ def main():
         for r in results:
             fm = r.get("from_me")
             dir_char = ">" if fm is True else "<" if fm is False else " "
-            print(f"[{r['timestamp'][:16]}] {dir_char} {_rtl((r['text'] or '').replace(chr(10), '  '))}")
+            sndr = r.get("sender_name")
+            who = f" {_rtl(sndr)}:" if sndr else ""    # group sender, when known
+            print(f"[{r['timestamp'][:16]}] {dir_char}{who} "
+                  f"{_rtl((r['text'] or '').replace(chr(10), '  '))}")
         return
 
     if args.json:

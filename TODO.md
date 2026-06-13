@@ -23,9 +23,10 @@ Effort: S (small) · M (medium) · L (large).
 ### Coverage
 - [ ] **Reply / quote context** (M) — show the message a reply quotes (needs
       extracting the quoted ref from the LevelDB V8 objects — feasibility first).
-- [ ] **Group-member attribution** (M) — who in a group sent each message
-      (group author JID from LevelDB — feasibility first; also lifts `from_me`
-      coverage past ~47%).
+- [x] **Group-member attribution** (M) — who in a group sent each message,
+      extracted from the LevelDB `author` JID-object and resolved to a name
+      (~100% of group messages on the test install). Stored as sender/sender_name;
+      shown in compact/JSON/MCP output.
 
 ### Packaging
 - [x] **pip packaging via uv** (S–M) — `pyproject.toml` + `warchive` /
